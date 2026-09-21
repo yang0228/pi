@@ -49,6 +49,8 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	/** "eager" writes the session header to disk during creation. Default: "deferred". */
+	kind?: "deferred" | "eager";
 }
 
 export interface SessionEntryBase {
@@ -901,6 +903,7 @@ export class SessionManager {
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
+	private eagerPersist: boolean = false;
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
@@ -919,6 +922,7 @@ export class SessionManager {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		this.eagerPersist = newSessionOptions?.kind === "eager";
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -990,7 +994,20 @@ export class SessionManager {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
 		}
+		this._persistEagerHeader();
 		return this.sessionFile;
+	}
+
+	/**
+	 * Write the header immediately for eager sessions so the file exists before the
+	 * first assistant turn. Deferred sessions (the default) keep the file off disk
+	 * until then, which keeps header-only sessions out of the session list.
+	 */
+	private _persistEagerHeader(): void {
+		if (!this.eagerPersist || !this.persist || !this.sessionFile) return;
+		if (existsSync(this.sessionFile)) return;
+		this._rewriteFile();
+		this.flushed = true;
 	}
 
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
@@ -1073,12 +1090,19 @@ export class SessionManager {
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
-			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
+			if (this.eagerPersist) {
+				// The header is already on disk. Keep appending so the file stays a
+				// usable session even when the process dies before an assistant turn.
+				if (!this.flushed) {
+					this._rewriteFile();
+					this.flushed = true;
+				} else {
+					appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				}
+				return;
 			}
+			// Mark as not flushed so when assistant arrives, all entries get written
+			this.flushed = false;
 			return;
 		}
 
@@ -1609,6 +1633,8 @@ export class SessionManager {
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
+	 * @param options Optional `id`, `parentSession`, and `kind`. `kind: "eager"` writes the session
+	 * file to disk during creation instead of waiting for the first assistant message.
 	 */
 	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);

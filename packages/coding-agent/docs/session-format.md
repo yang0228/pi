@@ -428,7 +428,7 @@ for (const line of lines) {
 Key methods for working with sessions programmatically.
 
 ### Static Creation Methods
-- `SessionManager.create(cwd, sessionDir?, options?)` - New session; `options` can set `id` and `parentSession`
+- `SessionManager.create(cwd, sessionDir?, options?)` - New session; `options` sets `id`, `parentSession`, and `kind`. With `kind: "eager"` the session file is written to disk during creation; the default (`"deferred"`) creates it on the first assistant message
 - `SessionManager.open(path, sessionDir?, cwdOverride?)` - Open existing session file
 - `SessionManager.continueRecent(cwd, sessionDir?)` - Continue most recent or create new
 - `SessionManager.inMemory(cwd?, options?, entries?)` - No file persistence, optionally initialized from entries
