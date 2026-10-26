@@ -22,6 +22,7 @@ import {
 	type ToolResultContentBlock,
 	ToolResultStatus,
 } from "@aws-sdk/client-bedrock-runtime";
+import { type DefaultProviderInit, defaultProvider } from "@aws-sdk/credential-provider-node";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
@@ -196,6 +197,10 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 
 		// in Node.js/Bun environment only
 		if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
+			// External login tools can replace shared credentials between requests (#11221).
+			config.credentialDefaultProvider = (init: DefaultProviderInit) =>
+				defaultProvider({ ...init, ignoreCache: true });
+
 			// Region resolution: ARN-embedded > explicit option > env vars > SDK default chain.
 			// When the model ID is an inference profile ARN, extract the region from it.
 			// This avoids conflicts with AWS_REGION set for other services.
