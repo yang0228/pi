@@ -7,6 +7,7 @@ use crate::exec::Control;
 use crate::frame::{EVENT, Frame};
 use crate::output::Output;
 use crate::sys;
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -640,9 +641,50 @@ impl FileWatcher<'_> {
         if event.need_rescan() || event.paths.is_empty() {
             return true;
         }
+        let paths: Vec<String> = event
+            .paths
+            .iter()
+            .map(|path| self.watched_spelling(&path.to_string_lossy()))
+            .collect();
         let mut flush = false;
-        for path in &event.paths {
-            let path = self.watched_spelling(&path.to_string_lossy());
+        if matches!(
+            event.kind,
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        ) {
+            // notify can discard a removed directory's native subtree while its identity remains unchanged.
+            let roots: Vec<(String, String)> = event
+                .paths
+                .iter()
+                .map(|path| {
+                    let path = path.to_string_lossy().into_owned();
+                    let canonical = self
+                        .installed
+                        .get(&path)
+                        .and_then(|installed| installed.canonical.clone())
+                        .unwrap_or_else(|| path.clone());
+                    (path, canonical)
+                })
+                .collect();
+            let stale: Vec<String> = self
+                .installed
+                .iter()
+                .filter(|(path, installed)| {
+                    roots.iter().any(|(root, canonical)| {
+                        is_within(path, root)
+                            || is_within(installed.canonical.as_deref().unwrap_or(path), canonical)
+                    })
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in stale {
+                self.installed.remove(&path);
+                if let Some(native) = &mut self.native {
+                    let _ = native.unwatch(Path::new(&path));
+                }
+                flush = true;
+            }
+        }
+        for path in paths {
             // Events about unrelated siblings of an ancestor, or about excluded entries, are ignored.
             if self.in_scope(&path) {
                 let reported = self.reported(&path);
@@ -774,5 +816,189 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
                 poll_at = Instant::now() + watcher.poll_interval;
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use notify::event::{ModifyKind, RemoveKind, RenameMode};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use std::{path::PathBuf, sync::atomic::AtomicU64};
+
+    fn watcher<'a>(
+        path: &str,
+        output: &'a Output,
+        control: &'a Control,
+    ) -> (FileWatcher<'a>, mpsc::Receiver<notify::Result<Event>>) {
+        let (events_sender, events) = mpsc::channel();
+        (
+            FileWatcher {
+                id: 1,
+                output,
+                control,
+                targets: vec![Target {
+                    path: path.to_string(),
+                    recursive: true,
+                    hidden: false,
+                    names: HashSet::new(),
+                }],
+                mode: Mode::Native,
+                poll_interval: Duration::from_millis(DEFAULT_POLL_MS),
+                max_directories: DEFAULT_MAX_DIRECTORIES,
+                snapshot: Snapshot::new(),
+                native: None,
+                events_sender,
+                installed: HashMap::new(),
+                events: HashSet::new(),
+                settle_at: None,
+            },
+            events,
+        )
+    }
+
+    fn install(watcher: &mut FileWatcher<'_>, path: &str, canonical: Option<&str>, ino: u64) {
+        watcher.installed.insert(
+            path.to_string(),
+            Installed {
+                dev: 1,
+                ino,
+                canonical: canonical.map(str::to_string),
+            },
+        );
+    }
+
+    #[test]
+    fn invalidates_only_the_removed_or_renamed_watch_subtree() {
+        // #11342: notify may discard a directory and its descendants without an inode change.
+        for kind in [
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        ] {
+            let output = Output::default();
+            let control = Control::default();
+            let (mut watcher, _events) = watcher("/work", &output, &control);
+            install(&mut watcher, "/work", None, 1);
+            install(&mut watcher, "/work/a", None, 2);
+            install(&mut watcher, "/work/a/child", None, 3);
+            install(&mut watcher, "/work/b", None, 4);
+
+            assert!(watcher.on_event(Ok(Event::new(kind).add_path("/work/a".into()))));
+            assert!(!watcher.installed.contains_key("/work/a"));
+            assert!(!watcher.installed.contains_key("/work/a/child"));
+            assert!(watcher.installed.contains_key("/work"));
+            assert!(watcher.installed.contains_key("/work/b"));
+            assert!(watcher.events.contains("/work/a"));
+        }
+    }
+
+    #[test]
+    fn invalidates_all_canonical_aliases_and_preserves_rename_path_spelling() {
+        for from in ["/real/a", "/work/link"] {
+            let output = Output::default();
+            let control = Control::default();
+            let (mut watcher, _events) = watcher("/work", &output, &control);
+            install(&mut watcher, "/work/link", Some("/real/a"), 1);
+            install(&mut watcher, "/work/alias", Some("/real/a"), 1);
+            install(&mut watcher, "/work/link/child", Some("/real/a/child"), 2);
+            install(&mut watcher, "/work/alias/child", Some("/real/a/child"), 2);
+            install(&mut watcher, "/work/b", Some("/real/b"), 3);
+            assert!(
+                watcher.on_event(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+                    RenameMode::Both,
+                )))
+                .add_path(from.into())
+                .add_path("/real/b".into())))
+            );
+
+            assert!(watcher.installed.is_empty());
+            if from == "/work/link" {
+                assert!(watcher.events.contains("/work/link"));
+            } else {
+                assert!(
+                    watcher.events.contains("/work/link") || watcher.events.contains("/work/alias")
+                );
+            }
+            assert!(watcher.events.contains("/work/b"));
+        }
+    }
+
+    #[test]
+    fn ordinary_child_removal_and_rename_keep_the_parent_watch() {
+        for kind in [
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        ] {
+            let output = Output::default();
+            let control = Control::default();
+            let (mut watcher, _events) = watcher("/work", &output, &control);
+            install(&mut watcher, "/work", None, 1);
+            install(&mut watcher, "/work/a", None, 2);
+            assert!(
+                watcher.on_event(Ok(Event::new(kind)
+                    .add_path("/work/a/old.md".into())
+                    .add_path("/work/a/new.md".into())))
+            );
+            assert_eq!(watcher.installed.len(), 2);
+            assert!(watcher.events.contains("/work/a/old.md"));
+            assert!(watcher.events.contains("/work/a/new.md"));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct Tree(PathBuf);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rearms_descendant_watches_when_the_directory_identity_survives() {
+        // #11342: emulate notify dropping the native subtree while keeping the installed records.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tree = Tree(std::env::temp_dir().join(format!(
+            "pi-env-watch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let directory = tree.0.join("a");
+        let child = directory.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let output = Output::default();
+        let control = Control::default();
+        let (mut watcher, events) = watcher(&tree.0.to_string_lossy(), &output, &control);
+        watcher
+            .sync(false)
+            .unwrap_or_else(|error| panic!("{}", error.failure().message));
+        let before = watcher.snapshot[&*directory.to_string_lossy()].clone();
+        let native = watcher.native.as_mut().unwrap();
+        native.unwatch(&child).unwrap();
+        native.unwatch(&directory).unwrap();
+        assert!(watcher.on_event(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(directory.clone())
+        )));
+        watcher
+            .sync(true)
+            .unwrap_or_else(|error| panic!("{}", error.failure().message));
+        assert!(watcher.snapshot[&*directory.to_string_lossy()] == before);
+
+        let file = child.join("y.md");
+        fs::write(&file, "new").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut reported = false;
+        while Instant::now() < deadline {
+            if let Ok(Ok(event)) =
+                events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                && event.paths.contains(&file)
+            {
+                reported = true;
+                break;
+            }
+        }
+        assert!(reported, "the re-armed child watch did not report y.md");
     }
 }

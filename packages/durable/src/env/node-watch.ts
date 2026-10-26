@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { type FSWatcher, watch as fsWatch, type Stats } from "node:fs";
 import { lstat, readdir, readFile, stat, statfs } from "node:fs/promises";
-import { dirname, relative, sep } from "node:path";
+import { basename, dirname, relative, sep } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { FileError, type FileWatcher, type WatchChange, type WatchTarget } from "./index.ts";
 
@@ -442,11 +442,21 @@ export class NodeFileWatcher implements FileWatcher {
 			if (this.#watchers.has(path) || entry === undefined) continue;
 			const linked = linkedFiles.has(path);
 			try {
-				const watcher = fsWatch(path, { recursive, persistent: false }, (_event, filename) =>
-					linked
-						? this.#onLinkedFileEvent(path)
-						: this.#onEvent(path, filename === null ? undefined : String(filename)),
-				);
+				const watcher = fsWatch(path, { recursive, persistent: false }, (event, filename) => {
+					if (this.#watchers.get(path)?.watcher !== watcher) return;
+					const name = filename === null ? undefined : String(filename);
+					if (linked) {
+						this.#onLinkedFileEvent(path);
+					} else if (perDirectory && event === "rename" && name === basename(path)) {
+						// Linux reports a dropped watch as a self-rename even if the inode survives. A same-named child
+						// is indistinguishable, so conservatively replace only this directory's watcher.
+						watcher.close();
+						this.#watchers.delete(path);
+						this.#onEvent(path, undefined);
+					} else {
+						this.#onEvent(path, name);
+					}
+				});
 				// A watched directory that disappears or fails: rescan, which also replaces the watcher.
 				watcher.on("error", () => {
 					watcher.close();
