@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { WatchChange } from "../src/env/index.ts";
+import type { FileChange } from "../src/env/index.ts";
 import { NodeFileWatcher } from "../src/env/node-watch.ts";
 
 type NativeWatch = {
@@ -56,12 +56,12 @@ afterEach(async () => {
 	Object.defineProperty(process, "platform", platform);
 });
 
-async function open(): Promise<{ directory: string; changes: WatchChange[] }> {
+async function open(): Promise<{ directory: string; changes: FileChange[] }> {
 	const root = mkdtempSync(join(tmpdir(), "pi-durable-watch-"));
 	roots.push(root);
 	const directory = join(root, "a");
 	mkdirSync(directory);
-	const changes: WatchChange[] = [];
+	const changes: FileChange[] = [];
 	watchers.push(
 		await NodeFileWatcher.open(
 			[{ path: directory, recursive: true }],
@@ -75,7 +75,7 @@ async function open(): Promise<{ directory: string; changes: WatchChange[] }> {
 	return { directory, changes };
 }
 
-function paths(changes: WatchChange[]): string[] {
+function paths(changes: FileChange[]): string[] {
 	return changes.flatMap((change) => ("paths" in change ? change.paths : []));
 }
 
